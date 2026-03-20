@@ -1,6 +1,3 @@
-// Pipeline: Checkout -> Maven Build -> Docker Build -> Login Public ECR -> Tag -> Push
-// No Kubernetes stage included yet (as requested).
-
 pipeline {
   agent { label 'slave' }
 
@@ -10,74 +7,60 @@ pipeline {
   }
 
   environment {
-    IMAGE_NAME   = "petclinic"
-    IMAGE_TAG    = "${BUILD_NUMBER}"
+    // ECR image details
+    ECR_REPO = "public.ecr.aws/e0f4k4s5/petclinic"
+    IMAGE_TAG = "latest"
 
-    // Your AWS Public ECR details
-    ECR_REGISTRY = "public.ecr.aws/e0f4k4s5"
-    ECR_REPO     = "public.ecr.aws/e0f4k4s5/petclinic"
+    // Kubernetes
+    K8S_NAMESPACE = "petclinic"
   }
 
   stages {
 
-    stage('Checkout') {
+    stage('Checkout Code') {
       steps {
         checkout scm
       }
     }
 
-    stage('Build (Maven)') {
-      steps {
-        sh 'java -version'
-        sh 'mvn -v'
-        sh 'mvn clean package -DskipTests'
-      }
-      post {
-        success {
-          archiveArtifacts artifacts: 'target/*.jar,target/*.war', fingerprint: true, allowEmptyArchive: true
-        }
-      }
-    }
-
-    stage('Docker Build') {
-      steps {
-        sh 'docker --version'
-        // Build local docker image with build-number tag
-        sh 'docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .'
-      }
-    }
-
-    stage('Login to Public ECR') {
+    stage('Verify Kubernetes Access') {
       steps {
         sh '''
-          aws --version
-          aws sts get-caller-identity
-
-          # Public ECR login always uses us-east-1
-          aws ecr-public get-login-password --region us-east-1 \
-          | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+          kubectl version --client
+          kubectl get nodes
         '''
       }
     }
 
-    stage('Tag & Push to Public ECR') {
+    stage('Deploy to EKS') {
       steps {
         sh '''
-          # Push build-number tag
-          docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${ECR_REPO}:${IMAGE_TAG}
-          docker push ${ECR_REPO}:${IMAGE_TAG}
+          kubectl create namespace ${K8S_NAMESPACE} || true
 
-          # Also push latest tag (optional but common)
-          docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${ECR_REPO}:latest
-          docker push ${ECR_REPO}:latest
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+          kubectl rollout status deployment/petclinic -n ${K8S_NAMESPACE}
+        '''
+      }
+    }
+
+    stage('Verify Deployment') {
+      steps {
+        sh '''
+          kubectl get pods -n ${K8S_NAMESPACE}
+          kubectl get svc -n ${K8S_NAMESPACE}
         '''
       }
     }
   }
 
   post {
-    always {
-      echo "Pipeline finished with status: ${currentBuild.currentResult}"
+    success {
+      echo "✅ Deployment to EKS successful"
+    }
+    failure {
+      echo "❌ Deployment failed"
     }
   }
 }
