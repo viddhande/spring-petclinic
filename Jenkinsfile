@@ -42,20 +42,20 @@ pipeline {
       }
     }
 
-    // ✅ ✅ SONARQUBE SCAN (GUARANTEED FIX)
+    // ✅ ✅ SONARQUBE SCAN (NO http:// ANYWHERE)
     stage('SonarQube Scan') {
       steps {
-        withCredentials([string(credentialsId: 'SONAR_TOKEN', variable: 'SONAR_TOKEN')]) {
-          withEnv(['SONAR_HOST_URL=http://13.203.195.66:9000']) {
-            sh '''
-              echo "Using SonarQube URL: $SONAR_HOST_URL"
-
-              mvn sonar:sonar \
-                -Dsonar.host.url=$SONAR_HOST_URL \
-                -Dsonar.login=${SONAR_TOKEN} \
-                -Dsonar.projectKey=petclinic
-            '''
-          }
+        withCredentials([
+          string(credentialsId: 'SONAR_TOKEN', variable: 'SONAR_TOKEN'),
+          string(credentialsId: 'SONAR_HOST_URL', variable: 'SONAR_HOST_URL')
+        ]) {
+          sh '''
+            echo "Running SonarQube scan"
+            mvn sonar:sonar \
+              -Dsonar.host.url=$SONAR_HOST_URL \
+              -Dsonar.login=$SONAR_TOKEN \
+              -Dsonar.projectKey=petclinic
+          '''
         }
       }
     }
@@ -126,3 +126,4 @@ pipeline {
     }
   }
 }
+``
