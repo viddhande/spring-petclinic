@@ -13,6 +13,9 @@ pipeline {
     IMAGE_NAME   = "petclinic"
     IMAGE_TAG    = "${BUILD_NUMBER}"
 
+    // SonarQube
+    SONAR_HOST_URL = "http://13.203.195.66:9000"
+
     // Kubernetes
     KUBECONFIG_PATH = "/home/jenkins/.kube/config"
     K8S_NAMESPACE   = "petclinic"
@@ -38,6 +41,20 @@ pipeline {
       post {
         success {
           archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+        }
+      }
+    }
+
+    // ✅ SonarQube integration (SECURE & CORRECT)
+    stage('SonarQube Scan') {
+      steps {
+        withCredentials([string(credentialsId: 'SONAR_TOKEN', variable: 'SONAR_TOKEN')]) {
+          sh '''
+            mvn sonar:sonar \
+              -Dsonar.host.url=${SONAR_HOST_URL} \
+              -Dsonar.login=${SONAR_TOKEN} \
+              -Dsonar.projectKey=petclinic
+          '''
         }
       }
     }
@@ -72,18 +89,10 @@ pipeline {
     stage('Deploy to EKS') {
       steps {
         sh '''
-          # 🔴 CRITICAL FIX
           export KUBECONFIG=${KUBECONFIG_PATH}
           export PATH=/usr/local/bin:$PATH
 
-          echo "Using kubeconfig:"
-          ls -l ${KUBECONFIG}
-
-          kubectl config get-contexts
           kubectl config use-context ${EKS_CONTEXT}
-
-          kubectl get nodes
-
           kubectl create namespace ${K8S_NAMESPACE} || true
 
           sed -i "s|REPLACE_IMAGE|${ECR_REPO}:${IMAGE_TAG}|g" k8s/deployment.yaml
@@ -109,7 +118,7 @@ pipeline {
 
   post {
     success {
-      echo "✅ CI/CD SUCCESS: Image pushed to ECR and deployed to EKS"
+      echo "✅ CI/CD SUCCESS: Build, SonarQube analysis, push, and deployment completed"
     }
     failure {
       echo "❌ Pipeline failed – check logs above"
