@@ -42,16 +42,20 @@ pipeline {
       }
     }
 
-    // ✅ SonarQube Scan (No http:// inside Jenkinsfile)
+    // ✅ ✅ SONARQUBE SCAN (GUARANTEED FIX)
     stage('SonarQube Scan') {
       steps {
         withCredentials([string(credentialsId: 'SONAR_TOKEN', variable: 'SONAR_TOKEN')]) {
-          sh '''
-            mvn sonar:sonar \
-              -Dsonar.host.url=$SONAR_HOST_URL \
-              -Dsonar.login=${SONAR_TOKEN} \
-              -Dsonar.projectKey=petclinic
-          '''
+          withEnv(['SONAR_HOST_URL=http://13.203.195.66:9000']) {
+            sh '''
+              echo "Using SonarQube URL: $SONAR_HOST_URL"
+
+              mvn sonar:sonar \
+                -Dsonar.host.url=$SONAR_HOST_URL \
+                -Dsonar.login=${SONAR_TOKEN} \
+                -Dsonar.projectKey=petclinic
+            '''
+          }
         }
       }
     }
