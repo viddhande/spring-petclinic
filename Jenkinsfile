@@ -13,9 +13,6 @@ pipeline {
     IMAGE_NAME   = "petclinic"
     IMAGE_TAG    = "${BUILD_NUMBER}"
 
-    // SonarQube
-    SONAR_HOST_URL = "http://13.203.195.66:9000"
-
     // Kubernetes
     KUBECONFIG_PATH = "/home/jenkins/.kube/config"
     K8S_NAMESPACE   = "petclinic"
@@ -45,13 +42,13 @@ pipeline {
       }
     }
 
-    // ✅ SonarQube integration (SECURE & CORRECT)
+    // ✅ SonarQube Scan (No http:// inside Jenkinsfile)
     stage('SonarQube Scan') {
       steps {
         withCredentials([string(credentialsId: 'SONAR_TOKEN', variable: 'SONAR_TOKEN')]) {
           sh '''
             mvn sonar:sonar \
-              -Dsonar.host.url=${SONAR_HOST_URL} \
+              -Dsonar.host.url=$SONAR_HOST_URL \
               -Dsonar.login=${SONAR_TOKEN} \
               -Dsonar.projectKey=petclinic
           '''
