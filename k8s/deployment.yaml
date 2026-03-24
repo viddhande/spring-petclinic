@@ -1,0 +1,23 @@
+cat > k8s/deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: petclinic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: petclinic
+  template:
+    metadata:
+      labels:
+        app: petclinic
+    spec:
+      imagePullSecrets:
+        - name: nexus-regcred
+      containers:
+        - name: petclinic
+          image: REPLACE_IMAGE
+          ports:
+            - containerPort: 8080
+EOF
