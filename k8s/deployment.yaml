@@ -1,4 +1,3 @@
-cat > k8s/deployment.yaml <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,7 +16,6 @@ spec:
         - name: nexus-regcred
       containers:
         - name: petclinic
-          image: REPLACE_IMAGE
+          image: 13.232.220.193:8082/docker-hosted/petclinic:1
           ports:
             - containerPort: 8080
-EOF
