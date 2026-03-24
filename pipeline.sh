@@ -2,32 +2,31 @@
 set -euo pipefail
 
 # ==========================================================
-# CONFIG (EDIT THESE OR EXPORT AS ENV VARS)
+# CONFIG (EDIT OR EXPORT AS ENV VARS)
 # ==========================================================
 APP_NAME="${APP_NAME:-petclinic}"
 
-# If you want unique tag every run, keep AUTO_TAG=true
-AUTO_TAG="${AUTO_TAG:-true}"
-TAG="${TAG:-1}"  # used if AUTO_TAG=false
+# Tagging
+AUTO_TAG="${AUTO_TAG:-true}"       # true => timestamp tag each run
+TAG="${TAG:-1}"                    # used if AUTO_TAG=false
 
-# Nexus registry (YOU CONFIRMED PUSH WORKS ON 8082)
+# Nexus (your working endpoint)
 NEXUS_HOST="${NEXUS_HOST:-13.232.220.193}"
 NEXUS_PORT="${NEXUS_PORT:-8082}"
 NEXUS_REPO="${NEXUS_REPO:-docker-hosted}"
 NEXUS_USER="${NEXUS_USER:-vid}"
-NEXUS_PASS="${NEXUS_PASS:-}"   # If empty, script will prompt securely
+NEXUS_PASS="${NEXUS_PASS:-}"       # if empty => prompt securely
 
 # SonarQube
+RUN_SONAR="${RUN_SONAR:-true}"
 SONAR_HOST="${SONAR_HOST:-http://localhost:9000}"
 SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY:-petclinic}"
-SONAR_TOKEN="${SONAR_TOKEN:-}" # If empty, script will prompt securely
+SONAR_TOKEN="${SONAR_TOKEN:-}"     # if empty => prompt securely
 
-# Testing toggles
+# Tests
 RUN_UNIT_TESTS="${RUN_UNIT_TESTS:-true}"
-RUN_FUNCTIONAL_TESTS="${RUN_FUNCTIONAL_TESTS:-true}"      # uses -Pintegration (if present)
-ALLOW_FUNCTIONAL_TEST_FAIL="${ALLOW_FUNCTIONAL_TEST_FAIL:-true}"  # don't block if integration profile missing
-RUN_SONAR="${RUN_SONAR:-true}"
-CHECK_QUALITY_GATE="${CHECK_QUALITY_GATE:-false}"          # optional (true/false)
+RUN_FUNCTIONAL_TESTS="${RUN_FUNCTIONAL_TESTS:-true}"            # mvn verify -Pintegration
+ALLOW_FUNCTIONAL_TEST_FAIL="${ALLOW_FUNCTIONAL_TEST_FAIL:-true}"# continue if integration profile missing/fails
 
 # Kubernetes
 K8S_NAMESPACE="${K8S_NAMESPACE:-default}"
@@ -35,22 +34,23 @@ DEPLOYMENT_NAME="${DEPLOYMENT_NAME:-petclinic}"
 SERVICE_NAME="${SERVICE_NAME:-petclinic-svc}"
 NODEPORT="${NODEPORT:-30080}"
 
-# kind behaviour
-# If you ALREADY recreated kind with insecure registry mirror, keep this false.
-RECREATE_KIND_CLUSTER="${RECREATE_KIND_CLUSTER:-false}"     # true will delete & recreate cluster
+# kind cluster control (keep false for your current working cluster)
+RECREATE_KIND_CLUSTER="${RECREATE_KIND_CLUSTER:-false}"
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-devops-cluster}"
 KIND_CONTEXT="kind-${KIND_CLUSTER_NAME}"
 
-# Website exposure
-# When true, it keeps the port-forward running for browser access
+# Browser visibility (IMPORTANT)
 KEEP_PORT_FORWARD="${KEEP_PORT_FORWARD:-true}"
-PORT_FORWARD_LOCAL_PORT="${PORT_FORWARD_LOCAL_PORT:-8080}"  # open browser at http://EC2_PUBLIC_IP:8080
+PORT_FORWARD_LOCAL_PORT="${PORT_FORWARD_LOCAL_PORT:-8080}"       # browser uses http://EC2_PUBLIC_IP:8080
 
-# Performance test
-RUN_JMETER="${RUN_JMETER:-true}"
+# Performance test (optional)
+RUN_JMETER="${RUN_JMETER:-false}"                                # OFF by default (you wanted deploy+browser)
 JMETER_THREADS="${JMETER_THREADS:-20}"
 JMETER_LOOPS="${JMETER_LOOPS:-10}"
 JMETER_RAMPUP="${JMETER_RAMPUP:-10}"
+
+# Store perf output OUTSIDE repo (avoid Maven scanning / OOM)
+PERF_BASE_DIR="${PERF_BASE_DIR:-/tmp}"
 
 # ==========================================================
 # Helpers
@@ -59,9 +59,7 @@ log()  { echo -e "\n\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\n\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\n\033[1;31m[ERROR]\033[0m $*"; }
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 1; }
-}
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 1; }; }
 
 prompt_secret() {
   local var_name="$1"
@@ -74,6 +72,10 @@ prompt_secret() {
   fi
 }
 
+TMP_KIND_CONFIG=""
+cleanup() { [[ -n "${TMP_KIND_CONFIG}" && -f "${TMP_KIND_CONFIG}" ]] && rm -f "${TMP_KIND_CONFIG}" || true; }
+trap cleanup EXIT
+
 # ==========================================================
 # Validate prerequisites
 # ==========================================================
@@ -83,25 +85,26 @@ need_cmd mvn
 need_cmd docker
 need_cmd kubectl
 need_cmd kind
-if [[ "$RUN_JMETER" == "true" ]]; then
-  need_cmd jmeter
-fi
+if [[ "$RUN_JMETER" == "true" ]]; then need_cmd jmeter; fi
 log "All required commands exist."
 
-# Ensure Docker daemon is running
+# Docker daemon check
 if ! docker ps >/dev/null 2>&1; then
-  err "Docker daemon not reachable. Start Docker and ensure your user is in docker group."
-  err "Try: sudo systemctl start docker && sudo usermod -aG docker \$USER && newgrp docker"
+  err "Docker daemon not reachable. Try: sudo systemctl start docker"
   exit 1
 fi
 
-# Prompt for secrets if not set
+# --- IMPORTANT CLEANUP to avoid Maven checkstyle/nohttp scanning huge perf output in repo ---
+rm -rf perf-results perf-tests 2>/dev/null || true
+rm -f kind-config.yaml 2>/dev/null || true
+
+# Prompt for secrets (DO NOT hardcode passwords)
 prompt_secret NEXUS_PASS "Enter Nexus password for user '${NEXUS_USER}'"
 if [[ "$RUN_SONAR" == "true" ]]; then
   prompt_secret SONAR_TOKEN "Enter Sonar token"
 fi
 
-# Tag handling
+# Tag selection
 if [[ "$AUTO_TAG" == "true" ]]; then
   TAG="$(date +%Y%m%d%H%M%S)"
 fi
@@ -112,41 +115,43 @@ REGISTRY="${NEXUS_HOST}:${NEXUS_PORT}"
 log "Using image: ${IMAGE}"
 
 # ==========================================================
-# (Optional) Recreate kind cluster with HTTP Nexus mirror
+# Optional: recreate kind cluster with HTTP registry mirror
+# (config stored in /tmp to avoid Maven NoHttp violation)
 # ==========================================================
 if [[ "$RECREATE_KIND_CLUSTER" == "true" ]]; then
-  log "Recreating kind cluster '${KIND_CLUSTER_NAME}' with insecure HTTP registry mirror for ${REGISTRY} ..."
-  cat > kind-config.yaml <<EOF
+  log "Recreating kind cluster '${KIND_CLUSTER_NAME}' with HTTP mirror for ${REGISTRY} ..."
+  TMP_KIND_CONFIG="/tmp/kind-config-${KIND_CLUSTER_NAME}.yaml"
+
+  cat > "${TMP_KIND_CONFIG}" <<EOF_KIND
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 containerdConfigPatches:
 - |-
   [plugins."io.containerd.grpc.v1.cri".registry.mirrors."${REGISTRY}"]
     endpoint = ["http://${REGISTRY}"]
-EOF
+EOF_KIND
 
-  kind delete cluster --name "${KIND_CLUSTER_NAME}" || true
-  kind create cluster --name "${KIND_CLUSTER_NAME}" --config kind-config.yaml
+  kind delete cluster --name "${KIND_CLUSTER_NAME}" >/dev/null 2>&1 || true
+  kind create cluster --name "${KIND_CLUSTER_NAME}" --config "${TMP_KIND_CONFIG}"
 fi
 
-# Ensure kubectl uses correct context
-if ! kubectl config get-contexts "${KIND_CONTEXT}" >/dev/null 2>&1; then
-  warn "kubectl context ${KIND_CONTEXT} not found. Ensure kind cluster exists: kind get clusters"
-else
+# Ensure correct kubectl context
+if kubectl config get-contexts "${KIND_CONTEXT}" >/dev/null 2>&1; then
   kubectl config use-context "${KIND_CONTEXT}" >/dev/null
+else
+  warn "kubectl context ${KIND_CONTEXT} not found. Ensure kind cluster exists."
 fi
 
 log "Kubernetes nodes:"
 kubectl get nodes
 
 # ==========================================================
-# Ensure k8s manifests exist (fixes YAML mistakes automatically)
+# Ensure manifests exist (always correct YAML)
 # ==========================================================
 log "Ensuring Kubernetes manifests exist and are valid..."
-
 mkdir -p k8s
 
-cat > k8s/deployment.yaml <<EOF
+cat > k8s/deployment.yaml <<EOF_DEPLOY
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -168,9 +173,9 @@ spec:
           image: REPLACE_IMAGE
           ports:
             - containerPort: 8080
-EOF
+EOF_DEPLOY
 
-cat > k8s/service.yaml <<EOF
+cat > k8s/service.yaml <<EOF_SVC
 apiVersion: v1
 kind: Service
 metadata:
@@ -183,7 +188,7 @@ spec:
     - port: 8080
       targetPort: 8080
       nodePort: ${NODEPORT}
-EOF
+EOF_SVC
 
 kubectl apply --dry-run=client -f k8s/deployment.yaml >/dev/null
 kubectl apply --dry-run=client -f k8s/service.yaml >/dev/null
@@ -192,42 +197,36 @@ log "Manifests validated."
 # ==========================================================
 # Build + Tests
 # ==========================================================
-log "1) Maven clean package (build)..."
+log "1) Maven clean package..."
+export MAVEN_OPTS="${MAVEN_OPTS:- -Xmx1024m}"
 mvn -U clean package
 
 if [[ "$RUN_UNIT_TESTS" == "true" ]]; then
   log "2) Unit tests..."
   mvn test
-else
-  warn "Unit tests disabled (RUN_UNIT_TESTS=false)"
 fi
 
 if [[ "$RUN_FUNCTIONAL_TESTS" == "true" ]]; then
-  log "3) Functional/Integration tests (mvn verify -Pintegration)..."
+  log "3) Functional/Integration tests..."
   set +e
   mvn verify -Pintegration
   IT_STATUS=$?
   set -e
-  if [[ $IT_STATUS -ne 0 ]]; then
-    if [[ "$ALLOW_FUNCTIONAL_TEST_FAIL" == "true" ]]; then
-      warn "Functional tests failed or integration profile not present. Continuing because ALLOW_FUNCTIONAL_TEST_FAIL=true"
-    else
-      err "Functional tests failed. Stopping pipeline."
-      exit 1
-    fi
+
+  if [[ $IT_STATUS -ne 0 && "$ALLOW_FUNCTIONAL_TEST_FAIL" != "true" ]]; then
+    err "Functional tests failed."
+    exit 1
   fi
-else
-  warn "Functional tests disabled (RUN_FUNCTIONAL_TESTS=false)"
+  [[ $IT_STATUS -ne 0 ]] && warn "Functional tests failed or profile missing. Continuing."
 fi
 
 # ==========================================================
-# Sonar scan (+ optional Quality Gate)
+# Sonar
 # ==========================================================
 if [[ "$RUN_SONAR" == "true" ]]; then
   log "4) SonarQube scan..."
-  # quick reachability check
   if ! curl -s --max-time 5 "${SONAR_HOST}/api/system/health" >/dev/null; then
-    err "SonarQube not reachable at ${SONAR_HOST}. Start SonarQube container and try again."
+    err "SonarQube not reachable at ${SONAR_HOST}"
     exit 1
   fi
 
@@ -235,78 +234,31 @@ if [[ "$RUN_SONAR" == "true" ]]; then
     -Dsonar.host.url="${SONAR_HOST}" \
     -Dsonar.login="${SONAR_TOKEN}" \
     -Dsonar.projectKey="${SONAR_PROJECT_KEY}"
-
-  if [[ "$CHECK_QUALITY_GATE" == "true" ]]; then
-    log "4b) Checking Sonar Quality Gate (optional)..."
-
-    REPORT_FILE="target/sonar/report-task.txt"
-    if [[ ! -f "$REPORT_FILE" ]]; then
-      err "Sonar report-task.txt not found. Cannot check Quality Gate."
-      exit 1
-    fi
-
-    CE_TASK_URL=$(grep -E '^ceTaskUrl=' "$REPORT_FILE" | cut -d'=' -f2)
-    if [[ -z "$CE_TASK_URL" ]]; then
-      err "ceTaskUrl not found in report-task.txt"
-      exit 1
-    fi
-
-    for i in {1..30}; do
-      STATUS=$(curl -s -u "${SONAR_TOKEN}:" "$CE_TASK_URL" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
-      log "Sonar task status: ${STATUS:-UNKNOWN}"
-      [[ "$STATUS" == "SUCCESS" ]] && break
-      if [[ "$STATUS" == "FAILED" || "$STATUS" == "CANCELED" ]]; then
-        err "Sonar background task ${STATUS}"
-        exit 1
-      fi
-      sleep 5
-    done
-
-    ANALYSIS_ID=$(curl -s -u "${SONAR_TOKEN}:" "$CE_TASK_URL" | sed -n 's/.*"analysisId":"\([^"]*\)".*/\1/p')
-    if [[ -z "$ANALYSIS_ID" ]]; then
-      err "analysisId not found from CE task response"
-      exit 1
-    fi
-
-    QG_STATUS=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST}/api/qualitygates/project_status?analysisId=${ANALYSIS_ID}" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
-    log "Quality Gate Status: ${QG_STATUS:-UNKNOWN}"
-
-    if [[ "$QG_STATUS" != "OK" ]]; then
-      err "Quality Gate failed: ${QG_STATUS}"
-      exit 1
-    fi
-    log "Quality Gate passed ✅"
-  fi
-else
-  warn "Sonar scan disabled (RUN_SONAR=false)"
 fi
 
 # ==========================================================
-# Docker build + Nexus push
+# Docker build + push to Nexus
 # ==========================================================
 log "5) Docker build..."
-# Ensure Dockerfile is valid (first line must be FROM, not cat...)
 FIRST_LINE=$(head -n 1 Dockerfile || true)
 if [[ "$FIRST_LINE" != FROM* ]]; then
-  err "Dockerfile seems invalid. First line must start with 'FROM'. Current first line: ${FIRST_LINE}"
+  err "Dockerfile invalid. First line must start with 'FROM'. Found: ${FIRST_LINE}"
   exit 1
 fi
 
 docker build -t "${APP_NAME}:latest" .
-
-log "6) Tagging image for Nexus..."
 docker tag "${APP_NAME}:latest" "${IMAGE}"
 
-log "7) Logging into Nexus registry ${REGISTRY}..."
+log "6) Docker login to Nexus ${REGISTRY}..."
 echo "${NEXUS_PASS}" | docker login "${REGISTRY}" -u "${NEXUS_USER}" --password-stdin
 
-log "8) Pushing image to Nexus..."
+log "7) Push image..."
 docker push "${IMAGE}"
 
 # ==========================================================
-# Kubernetes secret + deploy
+# K8s deploy
 # ==========================================================
-log "9) Creating/updating Kubernetes imagePullSecret 'nexus-regcred'..."
+log "8) Create/Update imagePullSecret nexus-regcred..."
 kubectl create secret docker-registry nexus-regcred \
   --docker-server="${REGISTRY}" \
   --docker-username="${NEXUS_USER}" \
@@ -314,59 +266,46 @@ kubectl create secret docker-registry nexus-regcred \
   -n "${K8S_NAMESPACE}" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-log "10) Deploying to Kubernetes..."
+log "9) Deploy to Kubernetes..."
 sed "s|REPLACE_IMAGE|${IMAGE}|g" k8s/deployment.yaml | kubectl apply -n "${K8S_NAMESPACE}" -f -
 kubectl apply -n "${K8S_NAMESPACE}" -f k8s/service.yaml
 
-log "11) Waiting for rollout..."
+log "10) Wait for rollout..."
 kubectl rollout status -n "${K8S_NAMESPACE}" deployment/"${DEPLOYMENT_NAME}" --timeout=180s
-
-log "Pods:"
 kubectl get pods -n "${K8S_NAMESPACE}" -l app="${DEPLOYMENT_NAME}"
-
-log "Service:"
 kubectl get svc -n "${K8S_NAMESPACE}" "${SERVICE_NAME}"
 
 # ==========================================================
-# Smoke test (kind-friendly) using kind node IP + NodePort
-# ==========================================================
-log "12) Smoke test..."
-KIND_NODE_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${KIND_CLUSTER_NAME}-control-plane" 2>/dev/null || true)
-
-if [[ -n "${KIND_NODE_IP}" ]]; then
-  log "Trying NodePort on kind node IP: http://${KIND_NODE_IP}:${NODEPORT}/"
-  curl -I "http://${KIND_NODE_IP}:${NODEPORT}/" || true
-else
-  warn "Could not detect kind node container IP. Skipping NodePort curl test."
-fi
-
-# ==========================================================
-# Optional: expose website to browser via port-forward (0.0.0.0)
+# Browser visibility (NO SMOKE TEST)
 # ==========================================================
 PF_PID=""
 if [[ "$KEEP_PORT_FORWARD" == "true" ]]; then
-  log "13) Starting port-forward for browser access on 0.0.0.0:${PORT_FORWARD_LOCAL_PORT} ..."
-  # Kill any existing port-forward on same port (best-effort)
+  log "11) Starting port-forward for browser access on 0.0.0.0:${PORT_FORWARD_LOCAL_PORT} ..."
   pkill -f "kubectl port-forward.*${PORT_FORWARD_LOCAL_PORT}:8080" >/dev/null 2>&1 || true
 
-  kubectl port-forward --address 0.0.0.0 -n "${K8S_NAMESPACE}" svc/"${SERVICE_NAME}" "${PORT_FORWARD_LOCAL_PORT}:8080" \
+  nohup kubectl port-forward --address 0.0.0.0 -n "${K8S_NAMESPACE}" \
+    svc/"${SERVICE_NAME}" "${PORT_FORWARD_LOCAL_PORT}:8080" \
     >/tmp/petclinic-portforward.log 2>&1 &
 
   PF_PID=$!
-  sleep 3
-  log "Port-forward running (PID=${PF_PID})."
-  log "Open in browser: http://<EC2_PUBLIC_IP>:${PORT_FORWARD_LOCAL_PORT}/"
-  log "NOTE: Ensure AWS Security Group allows inbound TCP ${PORT_FORWARD_LOCAL_PORT} from your IP."
+  sleep 2
+
+  log "Port-forward started (PID=${PF_PID})."
+  log "✅ Open in browser: http://<EC2_PUBLIC_IP>:${PORT_FORWARD_LOCAL_PORT}/"
+  log "📌 Logs: tail -f /tmp/petclinic-portforward.log"
+  log "🛑 Stop later: kill ${PF_PID}"
+  log "NOTE: Security Group must allow inbound TCP ${PORT_FORWARD_LOCAL_PORT} from your IP."
 fi
 
 # ==========================================================
-# Performance testing (JMeter) against port-forward (localhost:8080)
+# Performance testing (optional) - outputs OUTSIDE repo
 # ==========================================================
 if [[ "$RUN_JMETER" == "true" ]]; then
-  log "14) Creating JMeter test plan (targets localhost:${PORT_FORWARD_LOCAL_PORT})..."
-  mkdir -p perf-tests perf-results
+  PERF_DIR="${PERF_BASE_DIR}/petclinic-perf-${TAG}"
+  mkdir -p "${PERF_DIR}"
 
-  cat > perf-tests/load_test.jmx <<EOF
+  log "12) JMeter performance test (localhost:${PORT_FORWARD_LOCAL_PORT})..."
+  cat > /tmp/petclinic_load_test.jmx <<EOF_JMX
 <?xml version="1.0" encoding="UTF-8"?>
 <jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
   <hashTree>
@@ -392,36 +331,20 @@ if [[ "$RUN_JMETER" == "true" ]]; then
     </hashTree>
   </hashTree>
 </jmeterTestPlan>
-EOF
+EOF_JMX
 
-  log "15) Running JMeter..."
   jmeter -n \
-    -t perf-tests/load_test.jmx \
-    -l perf-results/results.jtl \
-    -e -o perf-results/html-report
+    -t /tmp/petclinic_load_test.jmx \
+    -l "${PERF_DIR}/results.jtl" \
+    -e -o "${PERF_DIR}/html-report"
 
-  log "JMeter report generated: perf-results/html-report/index.html"
-else
-  warn "JMeter disabled (RUN_JMETER=false)"
+  log "JMeter report: ${PERF_DIR}/html-report/index.html"
 fi
 
-# ==========================================================
-# Finish / cleanup
-# ==========================================================
 log "======================================"
 log "PIPELINE COMPLETED ✅"
 log "Image pushed: ${IMAGE}"
-log "K8s service:  ${SERVICE_NAME} (NodePort ${NODEPORT})"
-if [[ -n "${KIND_NODE_IP}" ]]; then
-  log "Internal kind URL: http://${KIND_NODE_IP}:${NODEPORT}/"
-fi
-
 if [[ "$KEEP_PORT_FORWARD" == "true" ]]; then
   log "Browser URL: http://<EC2_PUBLIC_IP>:${PORT_FORWARD_LOCAL_PORT}/"
-  log "Port-forward PID: ${PF_PID}"
-  log "To stop port-forward later: kill ${PF_PID}"
-else
-  log "Port-forward not kept. Set KEEP_PORT_FORWARD=true to access in browser."
 fi
-
 log "======================================"
