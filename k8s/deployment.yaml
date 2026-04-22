@@ -2,8 +2,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: petclinic
+  labels:
+    app: petclinic
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: petclinic
@@ -12,10 +14,8 @@ spec:
       labels:
         app: petclinic
     spec:
-      imagePullSecrets:
-        - name: nexus-regcred
       containers:
         - name: petclinic
-          image: 13.232.220.193:8082/docker-hosted/petclinic:1
+          image:013461378686.dkr.ecr.ap-south-1.amazonaws.com/petclinic:1
           ports:
             - containerPort: 8080
